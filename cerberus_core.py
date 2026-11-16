@@ -9,11 +9,9 @@ HMAC_SECRET = os.environ.get("AGENT_GAMES_HMAC_SECRET", "")
 def verify_hmac(raw_body, signature):
     if not HMAC_SECRET: 
         return True
-    
     expected_raw = hmac.new(HMAC_SECRET.encode('utf-8'), raw_body, hashlib.sha256).hexdigest()
     if hmac.compare_digest(expected_raw, signature or ""):
         return True
-    
     try:
         decoded_secret = bytes.fromhex(HMAC_SECRET)
         expected_hex = hmac.new(decoded_secret, raw_body, hashlib.sha256).hexdigest()
@@ -27,23 +25,25 @@ def sign_body(raw_body: bytes) -> str:
 
 def perform_seven_checks(task):
     try:
-        # PERBAIKAN: Menggunakan format HURUF_BESAR_UNTUK_REASON_CODE
+        # Menggunakan kode singkat tanpa spasi agar pasti lolos regex
         if task.get("recipient") != task.get("condition_recipient"):
             return False, "RECIPIENT_MISMATCH"
         if int(task.get("public_balance", 0)) < int(task.get("minimum", 0)):
             return False, "INSUFFICIENT_BALANCE"
         if task.get("hasBeenUsed", False):
-            return False, "PROOF_ALREADY_USED"
+            return False, "PROOF_USED"
         if int(task.get("current_block", 0)) > int(task.get("expiry_block", 0)):
-            return False, "TASK_EXPIRED"
+            return False, "EXPIRED"
         if int(task.get("amount", 0)) > int(task.get("max_transfer", 0)):
-            return False, "AMOUNT_EXCEEDS_LIMIT"
+            return False, "AMOUNT_LIMIT"
         if task.get("proof_vk") != task.get("registered_vk"):
             return False, "VK_MISMATCH"
         if "signature" not in task:
-            return False, "MISSING_SIGNATURE"
-        return True, "ALL_CHECKS_PASSED"
-    except Exception as e:
+            return False, "NO_SIGNATURE"
+        
+        # Jika sukses, gunakan "OK"
+        return True, "OK" 
+    except Exception:
         return False, "INTERNAL_ERROR"
 
 def generate_proof(is_valid, task):
@@ -92,7 +92,7 @@ def generate_proof(is_valid, task):
         result = subprocess.run(command, capture_output=True, text=True)
         
         if result.returncode != 0:
-            raise Exception(f"Snarkjs Gagal: {result.stderr or 'Witness calculation failed'}")
+            raise Exception(f"Snarkjs Gagal")
 
         with open(proof_path, 'r') as f:
             proof_data = json.load(f)
@@ -131,8 +131,7 @@ def handle_agent():
             "publicSignals": public_signals
         }
     except Exception as e:
-        # PERBAIKAN: Alasan error juga harus format schema yang valid
-        payload = {"decision": "REJECT", "reason_code": "GENERATE_PROOF_FAILED"}
+        payload = {"decision": "REJECT", "reason_code": "PROOF_FAILED"}
 
     resp_body = json.dumps(payload).encode('utf-8')
     resp_sig = sign_body(resp_body)
