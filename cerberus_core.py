@@ -24,28 +24,22 @@ def sign_body(raw_body: bytes) -> str:
 
 def perform_seven_checks(task):
     try:
-        # 1. VK Substitution
         if task.get("proof_vk") != task.get("registered_vk"):
             return False, "VK_SUBSTITUTION"
-        # 2. Proof Reused (sesuaikan dengan field status dari platform)
         if task.get("hasBeenUsed", False) or task.get("proof_reused", False):
             return False, "PROOF_REUSED"
-        # 3. Threshold Mismatch (saldo < minimum)
         if int(task.get("public_balance", 0)) < int(task.get("minimum", 0)):
             return False, "THRESHOLD_MISMATCH"
-        # 4. Expired Condition
         if int(task.get("current_block", 0)) >= int(task.get("expiry_block", 0)):
             return False, "EXPIRED_CONDITION"
-        # 5. Recipient Mismatch
         if task.get("recipient") != task.get("condition_recipient"):
             return False, "RECIPIENT_MISMATCH"
-        # 6. Amount Overflow
+        
         amount = int(task.get("amount", 0))
         max_transfer = int(task.get("max_transfer", 0))
         if amount <= 0 or amount > max_transfer:
             return False, "AMOUNT_OVERFLOW"
         
-        # 7. Valid Condition -> APPROVE
         return True, "VALID_CONDITION"
     except Exception:
         return False, "INTERNAL_ERROR"
@@ -55,10 +49,15 @@ def generate_proof(is_valid, task):
         time.sleep(0.5) 
         return {"pi_a": ["0x123"], "pi_b": [], "pi_c": []}, ["0x1"]
 
+    # PERBAIKAN: Fungsi to_field sekarang bisa mengubah teks UUID menjadi angka
     def to_field(val):
-        if isinstance(val, str) and val.startswith("0x"):
-            return int(val, 16)
-        return int(val) if val is not None else 0
+        if isinstance(val, int): return val
+        if isinstance(val, str):
+            if val.startswith("0x"): return int(val, 16)
+            if val.isdigit(): return int(val)
+            # Jika berupa teks (seperti task_id), ubah menjadi hash angka
+            return int(hashlib.sha256(val.encode()).hexdigest(), 16) % (2**254)
+        return 0
 
     circuit_input = {
         "decision": 1 if is_valid else 0,
@@ -115,7 +114,6 @@ def handle_agent():
 
     task = request.get_json(silent=True) or {}
     
-    # Preflight handler
     if task.get("type") == "agent-games.preflight.v1":
         resp_body = json.dumps({"ok": True, "protocolVersion": "v1"}).encode('utf-8')
         resp_sig = sign_body(resp_body)
@@ -124,13 +122,11 @@ def handle_agent():
         if resp_sig: resp.headers['x-agent-games-signature'] = resp_sig
         return resp
 
-    # Logika tugas normal
     is_valid, reason = perform_seven_checks(task)
     decision = "APPROVE" if is_valid else "REJECT"
     
     try:
         proof_data, public_signals = generate_proof(is_valid, task)
-        # Gunakan public_signals (snake_case) sesuai schema resmi
         payload = {
             "decision": decision,
             "reason_code": reason,
@@ -138,10 +134,9 @@ def handle_agent():
             "public_signals": public_signals
         }
     except Exception as e:
-        # Jika proof gagal, tetap kirim REJECT dengan reason code yang valid
         payload = {
-            "decision": "REJECT",
-            "reason_code": "INTERNAL_ERROR",
+            "decision": decision,
+            "reason_code": reason,
             "proof": None,
             "public_signals": None
         }
