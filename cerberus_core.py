@@ -7,8 +7,7 @@ PORT = int(os.environ.get("PORT", 3000))
 HMAC_SECRET = os.environ.get("AGENT_GAMES_HMAC_SECRET", "")
 
 def verify_hmac(raw_body, signature):
-    if not HMAC_SECRET: 
-        return True
+    if not HMAC_SECRET: return True
     expected_raw = hmac.new(HMAC_SECRET.encode('utf-8'), raw_body, hashlib.sha256).hexdigest()
     if hmac.compare_digest(expected_raw, signature or ""):
         return True
@@ -25,24 +24,29 @@ def sign_body(raw_body: bytes) -> str:
 
 def perform_seven_checks(task):
     try:
-        # Menggunakan kode singkat tanpa spasi agar pasti lolos regex
+        # 1. VK Substitution
+        if task.get("proof_vk") != task.get("registered_vk"):
+            return False, "VK_SUBSTITUTION"
+        # 2. Proof Reused (sesuaikan dengan field status dari platform)
+        if task.get("hasBeenUsed", False) or task.get("proof_reused", False):
+            return False, "PROOF_REUSED"
+        # 3. Threshold Mismatch (saldo < minimum)
+        if int(task.get("public_balance", 0)) < int(task.get("minimum", 0)):
+            return False, "THRESHOLD_MISMATCH"
+        # 4. Expired Condition
+        if int(task.get("current_block", 0)) >= int(task.get("expiry_block", 0)):
+            return False, "EXPIRED_CONDITION"
+        # 5. Recipient Mismatch
         if task.get("recipient") != task.get("condition_recipient"):
             return False, "RECIPIENT_MISMATCH"
-        if int(task.get("public_balance", 0)) < int(task.get("minimum", 0)):
-            return False, "INSUFFICIENT_BALANCE"
-        if task.get("hasBeenUsed", False):
-            return False, "PROOF_USED"
-        if int(task.get("current_block", 0)) > int(task.get("expiry_block", 0)):
-            return False, "EXPIRED"
-        if int(task.get("amount", 0)) > int(task.get("max_transfer", 0)):
-            return False, "AMOUNT_LIMIT"
-        if task.get("proof_vk") != task.get("registered_vk"):
-            return False, "VK_MISMATCH"
-        if "signature" not in task:
-            return False, "NO_SIGNATURE"
+        # 6. Amount Overflow
+        amount = int(task.get("amount", 0))
+        max_transfer = int(task.get("max_transfer", 0))
+        if amount <= 0 or amount > max_transfer:
+            return False, "AMOUNT_OVERFLOW"
         
-        # Jika sukses, gunakan "OK"
-        return True, "OK" 
+        # 7. Valid Condition -> APPROVE
+        return True, "VALID_CONDITION"
     except Exception:
         return False, "INTERNAL_ERROR"
 
@@ -92,7 +96,7 @@ def generate_proof(is_valid, task):
         result = subprocess.run(command, capture_output=True, text=True)
         
         if result.returncode != 0:
-            raise Exception(f"Snarkjs Gagal")
+            raise Exception("Snarkjs Gagal")
 
         with open(proof_path, 'r') as f:
             proof_data = json.load(f)
@@ -111,6 +115,7 @@ def handle_agent():
 
     task = request.get_json(silent=True) or {}
     
+    # Preflight handler
     if task.get("type") == "agent-games.preflight.v1":
         resp_body = json.dumps({"ok": True, "protocolVersion": "v1"}).encode('utf-8')
         resp_sig = sign_body(resp_body)
@@ -119,19 +124,27 @@ def handle_agent():
         if resp_sig: resp.headers['x-agent-games-signature'] = resp_sig
         return resp
 
+    # Logika tugas normal
     is_valid, reason = perform_seven_checks(task)
     decision = "APPROVE" if is_valid else "REJECT"
     
     try:
         proof_data, public_signals = generate_proof(is_valid, task)
+        # Gunakan public_signals (snake_case) sesuai schema resmi
         payload = {
-            "decision": decision, 
-            "reason_code": reason, 
-            "proof": proof_data, 
-            "publicSignals": public_signals
+            "decision": decision,
+            "reason_code": reason,
+            "proof": proof_data,
+            "public_signals": public_signals
         }
     except Exception as e:
-        payload = {"decision": "REJECT", "reason_code": "PROOF_FAILED"}
+        # Jika proof gagal, tetap kirim REJECT dengan reason code yang valid
+        payload = {
+            "decision": "REJECT",
+            "reason_code": "INTERNAL_ERROR",
+            "proof": None,
+            "public_signals": None
+        }
 
     resp_body = json.dumps(payload).encode('utf-8')
     resp_sig = sign_body(resp_body)
