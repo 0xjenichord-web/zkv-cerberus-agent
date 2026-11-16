@@ -34,12 +34,10 @@ def perform_seven_checks(data):
             return False, "EXPIRED_CONDITION"
         if data.get("recipient") != data.get("condition_recipient"):
             return False, "RECIPIENT_MISMATCH"
-        
         amount = int(data.get("amount", 0))
         max_transfer = int(data.get("max_transfer", 0))
         if amount <= 0 or amount > max_transfer:
             return False, "AMOUNT_OVERFLOW"
-        
         return True, "VALID_CONDITION"
     except Exception as e:
         print(f"Check Error: {e}")
@@ -91,12 +89,18 @@ def generate_proof(is_valid, data, task_id):
             public_path
         ]
         
-        result = subprocess.run(command, capture_output=True, text=True)
+        print("--> Menjalankan snarkjs (maksimal 25 detik)...")
+        try:
+            result = subprocess.run(command, capture_output=True, text=True, timeout=25)
+        except subprocess.TimeoutExpired:
+            print("!!! ERROR: Snarkjs timeout > 25 detik. Server terlalu lambat / RAM habis.")
+            raise Exception("Timeout")
         
         if result.returncode != 0:
-            print(f"SNARKJS ERROR: {result.stderr}") # Akan muncul di log Cloady
+            print(f"!!! SNARKJS ERROR: {result.stderr}")
             raise Exception("Snarkjs Gagal")
 
+        print("--> Proof berhasil dibuat!")
         with open(proof_path, 'r') as f:
             proof_data = json.load(f)
         with open(public_path, 'r') as f:
@@ -106,15 +110,18 @@ def generate_proof(is_valid, data, task_id):
 
 @app.route('/agent', methods=['POST'])
 def handle_agent():
+    print("\n=== [ZK-CERBERUS] MENERIMA HTTP REQUEST ===")
     raw_body = request.get_data()
     sig = request.headers.get("x-agent-games-signature")
     
     if not verify_hmac(raw_body, sig):
+        print("!!! ERROR: HMAC Signature tidak cocok (401)")
         return jsonify({"error": "Unauthorized"}), 401
 
     task = request.get_json(silent=True) or {}
     
     if task.get("type") == "agent-games.preflight.v1":
+        print("--> Merespons Preflight Check (200 OK)")
         resp_body = json.dumps({"ok": True, "protocolVersion": "v1"}).encode('utf-8')
         resp_sig = sign_body(resp_body)
         resp = make_response(resp_body, 200)
@@ -125,8 +132,10 @@ def handle_agent():
     task_data = task.get("input", {})
     task_id = task.get("task_id", "unknown")
 
+    print(f"--> Menerima Tugas: {task_id}")
     is_valid, reason = perform_seven_checks(task_data)
     decision = "APPROVE" if is_valid else "REJECT"
+    print(f"--> Keputusan: {decision} | Alasan: {reason}")
     
     try:
         proof_data, public_signals = generate_proof(is_valid, task_data, task_id)
@@ -137,7 +146,7 @@ def handle_agent():
             "public_signals": public_signals
         }
     except Exception as e:
-        # Jika error, tetap kirim reason_code yang benar, bukan PROOF_FAILED
+        print(f"--> Mengirim REJECT tanpa proof karena error: {e}")
         payload = {
             "decision": decision,
             "reason_code": reason,
@@ -150,6 +159,8 @@ def handle_agent():
     resp = make_response(resp_body, 200)
     resp.headers['Content-Type'] = 'application/json'
     if resp_sig: resp.headers['x-agent-games-signature'] = resp_sig
+    
+    print("=== RESPONS DIKIRIM KE ZKVERIFY ===\n")
     return resp
 
 @app.route('/health', methods=['GET'])
