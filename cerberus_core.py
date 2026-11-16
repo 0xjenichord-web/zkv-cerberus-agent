@@ -6,14 +6,27 @@ SIMULATION_MODE = False
 PORT = int(os.environ.get("PORT", 3000))
 HMAC_SECRET = os.environ.get("AGENT_GAMES_HMAC_SECRET", "")
 
-# --- FUNGSI HMAC YANG SUDAH DIPERBAIKI ---
+# --- FUNGSI HMAC YANG SUDAH DIPERBAIKI (RAW STRING + HEX FALLBACK) ---
 def verify_hmac(raw_body, signature):
-    if not HMAC_SECRET: return True
-    expected = hmac.new(HMAC_SECRET.encode('utf-8'), raw_body, hashlib.sha256).hexdigest()
-    return hmac.compare_digest(expected, signature or "")
+    if not HMAC_SECRET: 
+        return True
+    
+    # 1. Coba verifikasi dengan raw string (UTF-8)
+    expected_raw = hmac.new(HMAC_SECRET.encode('utf-8'), raw_body, hashlib.sha256).hexdigest()
+    if hmac.compare_digest(expected_raw, signature or ""):
+        return True
+    
+    # 2. Fallback: coba verifikasi dengan hex-decoded key
+    try:
+        decoded_secret = bytes.fromhex(HMAC_SECRET)
+        expected_hex = hmac.new(decoded_secret, raw_body, hashlib.sha256).hexdigest()
+        return hmac.compare_digest(expected_hex, signature or "")
+    except ValueError:
+        return False
 
 def sign_body(raw_body: bytes) -> str:
     if not HMAC_SECRET: return ""
+    # Gunakan raw string untuk menandatangani respons
     return hmac.new(HMAC_SECRET.encode('utf-8'), raw_body, hashlib.sha256).hexdigest()
 
 def perform_seven_checks(task):
@@ -101,6 +114,7 @@ def handle_agent():
 
     task = request.get_json(silent=True) or {}
     
+    # --- PREFLIGHT HANDLER ---
     if task.get("type") == "agent-games.preflight.v1":
         resp_body = json.dumps({"ok": True, "protocolVersion": "v1"}).encode('utf-8')
         resp_sig = sign_body(resp_body)
@@ -109,6 +123,7 @@ def handle_agent():
         if resp_sig: resp.headers['x-agent-games-signature'] = resp_sig
         return resp
 
+    # --- LOGIKA TUGAS NORMAL ---
     is_valid, reason = perform_seven_checks(task)
     decision = "APPROVE" if is_valid else "REJECT"
     
