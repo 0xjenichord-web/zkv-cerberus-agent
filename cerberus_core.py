@@ -1,79 +1,52 @@
-from flask import Flask, request, jsonify
-import subprocess
-import json
-import os
-import tempfile
-import time
+from flask import Flask, request, jsonify, make_response
+import subprocess, json, os, tempfile, time, hmac, hashlib
 
 app = Flask(__name__)
+SIMULATION_MODE = False
+PORT = int(os.environ.get("PORT", 3000))
 
-# =========================================================
-# KONFIGURASI ZK-CERBERUS
-# =========================================================
-SIMULATION_MODE = False  # Mode pertarungan sesungguhnya
-PORT = 3000
+# Pastikan Anda mengisi Environment Variable ini di Cloady nanti
+HMAC_SECRET = os.environ.get("AGENT_GAMES_HMAC_SECRET", "")
 
-# =========================================================
-# LOGIKA 7 PENGECEKAN (Fail-Closed)
-# =========================================================
+def verify_hmac(raw_body, signature):
+    if not HMAC_SECRET: return True  # Izinkan test lokal jika secret belum diset
+    expected = hmac.new(HMAC_SECRET.encode('utf-8'), raw_body, hashlib.sha256).hexdigest()
+    return hmac.compare_digest(expected, signature or "")
+
+def sign_body(raw_body):
+    if not HMAC_SECRET: return ""
+    return hmac.new(HMAC_SECRET.encode('utf-8'), raw_body, hashlib.sha256).hexdigest()
+
 def perform_seven_checks(task):
-    """
-    Mengembalikan (is_valid, reason).
-    Logika ini harus selaras dengan batasan sirkuit.
-    """
     try:
-        # 1. Cek Penerima (Recipient)
         if task.get("recipient") != task.get("condition_recipient"):
             return False, "Recipient mismatch"
-        
-        # 2. Cek Saldo (Balance) vs Minimum
         if int(task.get("public_balance", 0)) < int(task.get("minimum", 0)):
             return False, "Insufficient balance"
-        
-        # 3. Cek Double-Spend (Nullifier / History)
         if task.get("hasBeenUsed", False):
             return False, "Proof already used"
-        
-        # 4. Cek Waktu Kedaluwarsa (Expiry Block)
         if int(task.get("current_block", 0)) > int(task.get("expiry_block", 0)):
             return False, "Task expired"
-        
-        # 5. Cek Batas Maksimal Transfer
         if int(task.get("amount", 0)) > int(task.get("max_transfer", 0)):
             return False, "Amount exceeds limit"
-        
-        # 6. Cek Kecocokan Hash VK
         if task.get("proof_vk") != task.get("registered_vk"):
             return False, "VK mismatch"
-        
-        # 7. Cek Tanda Tangan (Placeholder HMAC)
         if "signature" not in task:
             return False, "Missing signature"
-
         return True, "All checks passed"
-        
     except Exception as e:
         return False, f"Error during checks: {str(e)}"
 
-# =========================================================
-# GENERATE PROOF ASLI (13 SINYAL)
-# =========================================================
 def generate_proof(is_valid, task):
     if SIMULATION_MODE:
-        print("[CERBERUS-SIMULASI] Membuat proof palsu...")
-        time.sleep(1) 
-        return {"pi_a": ["0x123", "0x456"], "pi_b": [], "pi_c": []}, ["0x1"]
+        time.sleep(0.5) 
+        return {"pi_a": ["0x123"], "pi_b": [], "pi_c": []}, ["0x1"]
 
-    print("[CERBERUS-ASLI] Menjalankan snarkjs...")
-    
-    # Konversi alamat hex ke integer (BigInt) untuk sirkuit
-    # Sirkuit menggunakan tipe field element (BN254)
     def to_field(val):
         if isinstance(val, str) and val.startswith("0x"):
             return int(val, 16)
         return int(val) if val is not None else 0
 
-    # Menyusun 13 input sinyal sesuai spesifikasi sirkuit resmi
     circuit_input = {
         "decision": 1 if is_valid else 0,
         "minimum": to_field(task.get("minimum", 0)),
@@ -87,7 +60,7 @@ def generate_proof(is_valid, task):
         "registeredVkHash": to_field(task.get("registered_vk", "0x0")),
         "proofVkHash": to_field(task.get("proof_vk", "0x0")),
         "taskId": to_field(task.get("task_id", 0)),
-        "salt": to_field(task.get("salt", 0)) # Input privat
+        "salt": to_field(task.get("salt", 0))
     }
     
     with tempfile.TemporaryDirectory() as tmpdir:
@@ -96,7 +69,7 @@ def generate_proof(is_valid, task):
         public_path = os.path.join(tmpdir, 'public.json')
 
         with open(input_path, 'w') as f:
-            json.dump(circuit_input, f, indent=2)
+            json.dump(circuit_input, f)
 
         command = [
             "snarkjs", "groth16", "fullProve",
@@ -110,8 +83,7 @@ def generate_proof(is_valid, task):
         result = subprocess.run(command, capture_output=True, text=True)
         
         if result.returncode != 0:
-            # Jika witness gagal, kemungkinan decision bertentangan dengan constraint sirkuit
-            raise Exception(f"Snarkjs Gagal: {result.stderr or 'Witness calculation failed (decision mismatch?)'}")
+            raise Exception(f"Snarkjs Gagal: {result.stderr or 'Witness calculation failed'}")
 
         with open(proof_path, 'r') as f:
             proof_data = json.load(f)
@@ -120,50 +92,50 @@ def generate_proof(is_valid, task):
             
         return proof_data, public_signals
 
-# =========================================================
-# ENDPOINT UTAMA AGEN
-# =========================================================
 @app.route('/agent', methods=['POST'])
-def handle_task():
-    start_time = time.time()
-    print("\n=== [ZK-CERBERUS] MENERIMA TUGAS BARU ===")
+def handle_agent():
+    raw_body = request.get_data()
+    sig = request.headers.get("x-agent-games-signature")
     
-    task = request.json
-    if not task:
-        return jsonify({"error": "Invalid JSON", "decision": "REJECT"}), 400
+    if not verify_hmac(raw_body, sig):
+        return jsonify({"error": "Unauthorized"}), 401
 
+    task = request.get_json(silent=True) or {}
+    
+    # 1. Deteksi Preflight dari zkVerify
+    if task.get("type") == "agent-games.preflight.v1":
+        resp_body = json.dumps({"ok": True, "protocolVersion": "v1"}).encode('utf-8')
+        resp_sig = sign_body(resp_body)
+        resp = make_response(resp_body, 200)
+        resp.headers['Content-Type'] = 'application/json'
+        if resp_sig: resp.headers['x-agent-games-signature'] = resp_sig
+        return resp
+
+    # 2. Logika Tugas Normal
     is_valid, reason = perform_seven_checks(task)
     decision = "APPROVE" if is_valid else "REJECT"
-    print(f"-> Keputusan: {decision}")
-    print(f"-> Alasan: {reason}")
-
+    
     try:
         proof_data, public_signals = generate_proof(is_valid, task)
-        
-        elapsed = round(time.time() - start_time, 2)
-        print(f"-> Waktu proses: {elapsed} detik")
-
-        return jsonify({
-            "decision": decision,
-            "proof": proof_data,
+        payload = {
+            "decision": decision, 
+            "reason_code": reason, 
+            "proof": proof_data, 
             "publicSignals": public_signals
-        })
-
+        }
     except Exception as e:
-        print(f"-> ERROR FATAL: {str(e)}")
-        # Fail-closed: kirim REJECT tanpa proof jika gagal
-        return jsonify({
-            "error": str(e),
-            "decision": "REJECT",
-            "proof": None,
-            "publicSignals": None
-        }), 500
+        payload = {"decision": "REJECT", "reason_code": f"ERROR: {e}"}
+
+    resp_body = json.dumps(payload).encode('utf-8')
+    resp_sig = sign_body(resp_body)
+    resp = make_response(resp_body, 200)
+    resp.headers['Content-Type'] = 'application/json'
+    if resp_sig: resp.headers['x-agent-games-signature'] = resp_sig
+    return resp
 
 @app.route('/health', methods=['GET'])
-def health_check():
+def health(): 
     return "ZK-CERBERUS is ALIVE", 200
 
 if __name__ == '__main__':
-    print(f"=== ZK-CERBERUS DIAKTIFKAN DI PORT {PORT} ===")
-    print(f"Mode Simulasi: {'AKTIF' if SIMULATION_MODE else 'NONAKTIF'}")
     app.run(host='0.0.0.0', port=PORT)
