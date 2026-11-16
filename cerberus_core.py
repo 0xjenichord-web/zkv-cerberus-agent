@@ -71,7 +71,7 @@ def generate_proof(is_valid, data, task_id):
         "registeredVkHash": to_field(data.get("registered_vk", "0x0")),
         "proofVkHash": to_field(data.get("proof_vk", "0x0")),
         "taskId": to_field(task_id),
-        "salt": to_field(data.get("proof_tx", 0)) # Menggunakan proof_tx sebagai salt
+        "salt": to_field(data.get("proof_tx", 0))
     }
     
     with tempfile.TemporaryDirectory() as tmpdir:
@@ -94,7 +94,7 @@ def generate_proof(is_valid, data, task_id):
         result = subprocess.run(command, capture_output=True, text=True)
         
         if result.returncode != 0:
-            print(f"Snarkjs Error: {result.stderr}")
+            print(f"SNARKJS ERROR: {result.stderr}") # Akan muncul di log Cloady
             raise Exception("Snarkjs Gagal")
 
         with open(proof_path, 'r') as f:
@@ -114,7 +114,6 @@ def handle_agent():
 
     task = request.get_json(silent=True) or {}
     
-    # Preflight handler
     if task.get("type") == "agent-games.preflight.v1":
         resp_body = json.dumps({"ok": True, "protocolVersion": "v1"}).encode('utf-8')
         resp_sig = sign_body(resp_body)
@@ -123,7 +122,6 @@ def handle_agent():
         if resp_sig: resp.headers['x-agent-games-signature'] = resp_sig
         return resp
 
-    # Ekstrak data dari dalam objek "input"
     task_data = task.get("input", {})
     task_id = task.get("task_id", "unknown")
 
@@ -139,7 +137,7 @@ def handle_agent():
             "public_signals": public_signals
         }
     except Exception as e:
-        print(f"Proof Error: {e}")
+        # Jika error, tetap kirim reason_code yang benar, bukan PROOF_FAILED
         payload = {
             "decision": decision,
             "reason_code": reason,
