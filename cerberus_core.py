@@ -22,57 +22,56 @@ def sign_body(raw_body: bytes) -> str:
     if not HMAC_SECRET: return ""
     return hmac.new(HMAC_SECRET.encode('utf-8'), raw_body, hashlib.sha256).hexdigest()
 
-def perform_seven_checks(task):
+def perform_seven_checks(data):
     try:
-        if task.get("proof_vk") != task.get("registered_vk"):
+        if data.get("proof_vk") != data.get("registered_vk"):
             return False, "VK_SUBSTITUTION"
-        if task.get("hasBeenUsed", False) or task.get("proof_reused", False):
+        if data.get("hasBeenUsed", False) or data.get("proof_reused", False):
             return False, "PROOF_REUSED"
-        if int(task.get("public_balance", 0)) < int(task.get("minimum", 0)):
+        if int(data.get("public_balance", 0)) < int(data.get("minimum", 0)):
             return False, "THRESHOLD_MISMATCH"
-        if int(task.get("current_block", 0)) >= int(task.get("expiry_block", 0)):
+        if int(data.get("current_block", 0)) >= int(data.get("expiry_block", 0)):
             return False, "EXPIRED_CONDITION"
-        if task.get("recipient") != task.get("condition_recipient"):
+        if data.get("recipient") != data.get("condition_recipient"):
             return False, "RECIPIENT_MISMATCH"
         
-        amount = int(task.get("amount", 0))
-        max_transfer = int(task.get("max_transfer", 0))
+        amount = int(data.get("amount", 0))
+        max_transfer = int(data.get("max_transfer", 0))
         if amount <= 0 or amount > max_transfer:
             return False, "AMOUNT_OVERFLOW"
         
         return True, "VALID_CONDITION"
-    except Exception:
+    except Exception as e:
+        print(f"Check Error: {e}")
         return False, "INTERNAL_ERROR"
 
-def generate_proof(is_valid, task):
+def generate_proof(is_valid, data, task_id):
     if SIMULATION_MODE:
         time.sleep(0.5) 
         return {"pi_a": ["0x123"], "pi_b": [], "pi_c": []}, ["0x1"]
 
-    # PERBAIKAN: Fungsi to_field sekarang bisa mengubah teks UUID menjadi angka
     def to_field(val):
         if isinstance(val, int): return val
         if isinstance(val, str):
             if val.startswith("0x"): return int(val, 16)
             if val.isdigit(): return int(val)
-            # Jika berupa teks (seperti task_id), ubah menjadi hash angka
             return int(hashlib.sha256(val.encode()).hexdigest(), 16) % (2**254)
         return 0
 
     circuit_input = {
         "decision": 1 if is_valid else 0,
-        "minimum": to_field(task.get("minimum", 0)),
-        "publicBalance": to_field(task.get("public_balance", 0)),
-        "amount": to_field(task.get("amount", 0)),
-        "maxTransfer": to_field(task.get("max_transfer", 0)),
-        "expiryBlock": to_field(task.get("expiry_block", 0)),
-        "currentBlock": to_field(task.get("current_block", 0)),
-        "recipient": to_field(task.get("recipient", "0x0")),
-        "conditionRecipient": to_field(task.get("condition_recipient", "0x0")),
-        "registeredVkHash": to_field(task.get("registered_vk", "0x0")),
-        "proofVkHash": to_field(task.get("proof_vk", "0x0")),
-        "taskId": to_field(task.get("task_id", 0)),
-        "salt": to_field(task.get("salt", 0))
+        "minimum": to_field(data.get("minimum", 0)),
+        "publicBalance": to_field(data.get("public_balance", 0)),
+        "amount": to_field(data.get("amount", 0)),
+        "maxTransfer": to_field(data.get("max_transfer", 0)),
+        "expiryBlock": to_field(data.get("expiry_block", 0)),
+        "currentBlock": to_field(data.get("current_block", 0)),
+        "recipient": to_field(data.get("recipient", "0x0")),
+        "conditionRecipient": to_field(data.get("condition_recipient", "0x0")),
+        "registeredVkHash": to_field(data.get("registered_vk", "0x0")),
+        "proofVkHash": to_field(data.get("proof_vk", "0x0")),
+        "taskId": to_field(task_id),
+        "salt": to_field(data.get("proof_tx", 0)) # Menggunakan proof_tx sebagai salt
     }
     
     with tempfile.TemporaryDirectory() as tmpdir:
@@ -95,6 +94,7 @@ def generate_proof(is_valid, task):
         result = subprocess.run(command, capture_output=True, text=True)
         
         if result.returncode != 0:
+            print(f"Snarkjs Error: {result.stderr}")
             raise Exception("Snarkjs Gagal")
 
         with open(proof_path, 'r') as f:
@@ -114,6 +114,7 @@ def handle_agent():
 
     task = request.get_json(silent=True) or {}
     
+    # Preflight handler
     if task.get("type") == "agent-games.preflight.v1":
         resp_body = json.dumps({"ok": True, "protocolVersion": "v1"}).encode('utf-8')
         resp_sig = sign_body(resp_body)
@@ -122,11 +123,15 @@ def handle_agent():
         if resp_sig: resp.headers['x-agent-games-signature'] = resp_sig
         return resp
 
-    is_valid, reason = perform_seven_checks(task)
+    # Ekstrak data dari dalam objek "input"
+    task_data = task.get("input", {})
+    task_id = task.get("task_id", "unknown")
+
+    is_valid, reason = perform_seven_checks(task_data)
     decision = "APPROVE" if is_valid else "REJECT"
     
     try:
-        proof_data, public_signals = generate_proof(is_valid, task)
+        proof_data, public_signals = generate_proof(is_valid, task_data, task_id)
         payload = {
             "decision": decision,
             "reason_code": reason,
@@ -134,6 +139,7 @@ def handle_agent():
             "public_signals": public_signals
         }
     except Exception as e:
+        print(f"Proof Error: {e}")
         payload = {
             "decision": decision,
             "reason_code": reason,
