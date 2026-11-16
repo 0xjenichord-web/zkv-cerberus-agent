@@ -1,171 +1,58 @@
-from flask import Flask, request, jsonify, make_response
-import subprocess, json, os, tempfile, time, hmac, hashlib
-
-app = Flask(__name__)
-SIMULATION_MODE = False
-PORT = int(os.environ.get("PORT", 3000))
-HMAC_SECRET = os.environ.get("AGENT_GAMES_HMAC_SECRET", "")
-
-def verify_hmac(raw_body, signature):
-    if not HMAC_SECRET: return True
-    expected_raw = hmac.new(HMAC_SECRET.encode('utf-8'), raw_body, hashlib.sha256).hexdigest()
-    if hmac.compare_digest(expected_raw, signature or ""):
-        return True
-    try:
-        decoded_secret = bytes.fromhex(HMAC_SECRET)
-        expected_hex = hmac.new(decoded_secret, raw_body, hashlib.sha256).hexdigest()
-        return hmac.compare_digest(expected_hex, signature or "")
-    except ValueError:
-        return False
-
-def sign_body(raw_body: bytes) -> str:
-    if not HMAC_SECRET: return ""
-    return hmac.new(HMAC_SECRET.encode('utf-8'), raw_body, hashlib.sha256).hexdigest()
-
-def perform_seven_checks(data):
-    try:
-        if data.get("proof_vk") != data.get("registered_vk"):
-            return False, "VK_SUBSTITUTION"
-        if data.get("hasBeenUsed", False) or data.get("proof_reused", False):
-            return False, "PROOF_REUSED"
-        if int(data.get("public_balance", 0)) < int(data.get("minimum", 0)):
-            return False, "THRESHOLD_MISMATCH"
-        if int(data.get("current_block", 0)) >= int(data.get("expiry_block", 0)):
-            return False, "EXPIRED_CONDITION"
-        if data.get("recipient") != data.get("condition_recipient"):
-            return False, "RECIPIENT_MISMATCH"
-        amount = int(data.get("amount", 0))
-        max_transfer = int(data.get("max_transfer", 0))
-        if amount <= 0 or amount > max_transfer:
-            return False, "AMOUNT_OVERFLOW"
-        return True, "VALID_CONDITION"
-    except Exception as e:
-        print(f"Check Error: {e}")
-        return False, "INTERNAL_ERROR"
-
-def generate_proof(is_valid, data, task_id):
-    if SIMULATION_MODE:
-        time.sleep(0.5) 
-        return {"pi_a": ["0x123"], "pi_b": [], "pi_c": []}, ["0x1"]
-
-    def to_field(val):
-        if isinstance(val, int): return val
-        if isinstance(val, str):
-            if val.startswith("0x"): return int(val, 16)
-            if val.isdigit(): return int(val)
-            return int(hashlib.sha256(val.encode()).hexdigest(), 16) % (2**254)
-        return 0
-
-    circuit_input = {
-        "decision": 1 if is_valid else 0,
-        "minimum": to_field(data.get("minimum", 0)),
-        "publicBalance": to_field(data.get("public_balance", 0)),
-        "amount": to_field(data.get("amount", 0)),
-        "maxTransfer": to_field(data.get("max_transfer", 0)),
-        "expiryBlock": to_field(data.get("expiry_block", 0)),
-        "currentBlock": to_field(data.get("current_block", 0)),
-        "recipient": to_field(data.get("recipient", "0x0")),
-        "conditionRecipient": to_field(data.get("condition_recipient", "0x0")),
-        "registeredVkHash": to_field(data.get("registered_vk", "0x0")),
-        "proofVkHash": to_field(data.get("proof_vk", "0x0")),
-        "taskId": to_field(task_id),
-        "salt": to_field(data.get("proof_tx", 0))
-    }
-    
-    with tempfile.TemporaryDirectory() as tmpdir:
-        input_path = os.path.join(tmpdir, 'input.json')
-        proof_path = os.path.join(tmpdir, 'proof.json')
-        public_path = os.path.join(tmpdir, 'public.json')
-
-        with open(input_path, 'w') as f:
-            json.dump(circuit_input, f)
-
-        command = [
-            "snarkjs", "groth16", "fullProve",
-            input_path,
-            "./circuits/gatekeeper.wasm",
-            "./circuits/gatekeeper_final.zkey",
-            proof_path,
-            public_path
-        ]
-        
-        print("--> Menjalankan snarkjs (maksimal 25 detik)...")
-        try:
-            result = subprocess.run(command, capture_output=True, text=True, timeout=25)
-        except subprocess.TimeoutExpired:
-            print("!!! ERROR: Snarkjs timeout > 25 detik. Server terlalu lambat / RAM habis.")
-            raise Exception("Timeout")
-        
-        if result.returncode != 0:
-            print(f"!!! SNARKJS ERROR: {result.stderr}")
-            raise Exception("Snarkjs Gagal")
-
-        print("--> Proof berhasil dibuat!")
-        with open(proof_path, 'r') as f:
-            proof_data = json.load(f)
-        with open(public_path, 'r') as f:
-            public_signals = json.load(f)
-            
-        return proof_data, public_signals
-
-@app.route('/agent', methods=['POST'])
-def handle_agent():
-    print("\n=== [ZK-CERBERUS] MENERIMA HTTP REQUEST ===")
-    raw_body = request.get_data()
-    sig = request.headers.get("x-agent-games-signature")
-    
-    if not verify_hmac(raw_body, sig):
-        print("!!! ERROR: HMAC Signature tidak cocok (401)")
-        return jsonify({"error": "Unauthorized"}), 401
-
-    task = request.get_json(silent=True) or {}
-    
-    if task.get("type") == "agent-games.preflight.v1":
-        print("--> Merespons Preflight Check (200 OK)")
-        resp_body = json.dumps({"ok": True, "protocolVersion": "v1"}).encode('utf-8')
-        resp_sig = sign_body(resp_body)
-        resp = make_response(resp_body, 200)
-        resp.headers['Content-Type'] = 'application/json'
-        if resp_sig: resp.headers['x-agent-games-signature'] = resp_sig
-        return resp
-
-    task_data = task.get("input", {})
-    task_id = task.get("task_id", "unknown")
-
-    print(f"--> Menerima Tugas: {task_id}")
-    is_valid, reason = perform_seven_checks(task_data)
-    decision = "APPROVE" if is_valid else "REJECT"
-    print(f"--> Keputusan: {decision} | Alasan: {reason}")
-    
-    try:
-        proof_data, public_signals = generate_proof(is_valid, task_data, task_id)
-        payload = {
             "decision": decision,
             "reason_code": reason,
+            "proof_tx": proof_tx,
             "proof": proof_data,
-            "public_signals": public_signals
-        }
-    except Exception as e:
-        print(f"--> Mengirim REJECT tanpa proof karena error: {e}")
-        payload = {
-            "decision": decision,
-            "reason_code": reason,
-            "proof": None,
-            "public_signals": None
+            "public_signals": public_signals,
         }
 
-    resp_body = json.dumps(payload).encode('utf-8')
-    resp_sig = sign_body(resp_body)
-    resp = make_response(resp_body, 200)
-    resp.headers['Content-Type'] = 'application/json'
-    if resp_sig: resp.headers['x-agent-games-signature'] = resp_sig
-    
-    print("=== RESPONS DIKIRIM KE ZKVERIFY ===\n")
-    return resp
+        if is_valid and reuse_key:
+            state["accepted"][reuse_key] = task_id
+        if task_id != "unknown":
+            state["tasks"][task_id] = payload
+        save_state(state)
 
-@app.route('/health', methods=['GET'])
-def health(): 
+    log("=== RESPONS DIKIRIM KE ZKVERIFY ===\n")
+    return reply(payload)
+
+
+@app.route("/health", methods=["GET"])
+def health():
     return "ZK-CERBERUS is ALIVE", 200
 
-if __name__ == '__main__':
-    app.run(host='0.0.0.0', port=PORT)
+
+# ---------------------------------------------------------------- selftest
+def selftest():
+    """python cerberus_core.py selftest  -> uji proof untuk tiap jenis keputusan."""
+    base = {
+        "registered_vk": "0x7d3a", "proof_vk": "0x7d3a",
+        "minimum": "1000", "public_balance": "1460",
+        "expiry_block": 19842201, "current_block": 19832000,
+        "recipient": "0xde42", "condition_recipient": "0xde42",
+        "amount": "500", "max_transfer": "1000", "proof_tx": "0xa4c1",
+    }
+    cases = [
+        ("VALID_CONDITION", {}),
+        ("VK_SUBSTITUTION", {"proof_vk": "0x9999"}),
+        ("THRESHOLD_MISMATCH", {"public_balance": "900"}),
+        ("EXPIRED_CONDITION", {"current_block": 19842201}),
+        ("RECIPIENT_MISMATCH", {"condition_recipient": "0xbeef"}),
+        ("AMOUNT_OVERFLOW", {"amount": "1500"}),
+    ]
+    for expected, change in cases:
+        d = dict(base, **change)
+        ok, reason = perform_seven_checks(d)
+        try:
+            _, signals = generate_proof(ok, d, "selftest")
+            res = f"proof OK (decision signal={signals[-2] if len(signals) > 1 else '?'})"
+        except Exception as e:
+            res = f"proof GAGAL: {str(e)[:200]}"
+        status = "cocok" if reason == expected else f"BEDA (dapat {reason})"
+        print(f"{expected:20} alasan {status:8} | {res}", flush=True)
+
+
+if __name__ == "__main__":
+    if len(sys.argv) > 1 and sys.argv[1] == "selftest":
+        selftest()
+    else:
+        app.run(host="0.0.0.0", port=PORT)
+        
