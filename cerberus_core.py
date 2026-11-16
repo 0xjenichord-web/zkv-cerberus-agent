@@ -4,16 +4,15 @@ import subprocess, json, os, tempfile, time, hmac, hashlib
 app = Flask(__name__)
 SIMULATION_MODE = False
 PORT = int(os.environ.get("PORT", 3000))
-
-# Pastikan Anda mengisi Environment Variable ini di Cloady nanti
 HMAC_SECRET = os.environ.get("AGENT_GAMES_HMAC_SECRET", "")
 
+# --- FUNGSI HMAC YANG SUDAH DIPERBAIKI ---
 def verify_hmac(raw_body, signature):
-    if not HMAC_SECRET: return True  # Izinkan test lokal jika secret belum diset
+    if not HMAC_SECRET: return True
     expected = hmac.new(HMAC_SECRET.encode('utf-8'), raw_body, hashlib.sha256).hexdigest()
     return hmac.compare_digest(expected, signature or "")
 
-def sign_body(raw_body):
+def sign_body(raw_body: bytes) -> str:
     if not HMAC_SECRET: return ""
     return hmac.new(HMAC_SECRET.encode('utf-8'), raw_body, hashlib.sha256).hexdigest()
 
@@ -102,7 +101,6 @@ def handle_agent():
 
     task = request.get_json(silent=True) or {}
     
-    # 1. Deteksi Preflight dari zkVerify
     if task.get("type") == "agent-games.preflight.v1":
         resp_body = json.dumps({"ok": True, "protocolVersion": "v1"}).encode('utf-8')
         resp_sig = sign_body(resp_body)
@@ -111,7 +109,6 @@ def handle_agent():
         if resp_sig: resp.headers['x-agent-games-signature'] = resp_sig
         return resp
 
-    # 2. Logika Tugas Normal
     is_valid, reason = perform_seven_checks(task)
     decision = "APPROVE" if is_valid else "REJECT"
     
